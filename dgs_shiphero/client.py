@@ -47,13 +47,20 @@ class ShipHeroClient:
 
     def __init__(self, refresh_token_env="SHIPHERO_REFRESH_TOKEN", *,
                  refresh_token=None, auth_url=SHIPHERO_AUTH_URL,
-                 graphql_url=SHIPHERO_GRAPHQL_URL):
+                 graphql_url=SHIPHERO_GRAPHQL_URL,
+                 credit_store=None, gate_max_wait=30.0):
         self._refresh_token_env = refresh_token_env
         self._refresh_token = refresh_token  # explicit value wins over the env var
         self._auth_url = auth_url
         self._graphql_url = graphql_url
         self._token_cache = {"access_token": None, "expires_at": 0}
         self._usage = {"calls": 0, "credits": 0, "log": []}
+        # Optional shared-credit coordinator (Phase 3): a duck-typed object with
+        # gate() -> {"ok", "wait_seconds"} and charge(cost). Every store call is
+        # best-effort (see _await_credit / _charge_credit), so a ledger outage can
+        # never block a ShipHero request for either app.
+        self._credit_store = credit_store
+        self._gate_max_wait = gate_max_wait
 
     # ---- auth -------------------------------------------------------------
     def get_access_token(self):
@@ -92,6 +99,7 @@ class ShipHeroClient:
         failure. No retry — the exact contract ops-portal's ``_graphql_request``
         had (the HTTP-error message still starts with ``ShipHero <status>`` so
         callers that string-match ``"429"`` keep working)."""
+        self._await_credit()  # shared-budget gate (fail-open; no-op without a store)
         headers = {"Authorization": f"Bearer {self.get_access_token()}",
                    "Content-Type": "application/json"}
         resp = requests.post(
@@ -105,7 +113,8 @@ class ShipHeroClient:
         if "errors" in result:
             raise ShipHeroError(result["errors"])
         data = result["data"]
-        self._record_usage(query, data)
+        complexity = self._record_usage(query, data)
+        self._charge_credit(complexity)  # deduct the actual cost from the shared budget
         return data
 
     def graphql(self, query, variables=None, timeout=30, *,
@@ -157,6 +166,40 @@ class ShipHeroClient:
         u["log"].append({"op": _op_snippet(query), "complexity": complexity})
         if len(u["log"]) > _USAGE_LOG_MAX:
             del u["log"][:-_USAGE_LOG_MAX]
+        return complexity
+
+    # ---- shared credit ledger (best-effort; never blocks a ShipHero call) --
+    def _await_credit(self):
+        """Before a query: consult the shared credit budget and wait out a
+        depletion, bounded by ``gate_max_wait``. Fail-open — any store error just
+        proceeds, so a ledger outage can't take ShipHero down for either app."""
+        store = self._credit_store
+        if store is None:
+            return
+        waited = 0.0
+        while True:
+            try:
+                r = store.gate()
+            except Exception:
+                return  # fail open
+            if not isinstance(r, dict) or r.get("ok", True):
+                return
+            wait = float(r.get("wait_seconds") or 0)
+            if wait <= 0 or waited >= self._gate_max_wait:
+                return  # give up; ShipHero's own code-30 retry covers true exhaustion
+            wait = min(wait, self._gate_max_wait - waited, 5.0)
+            time.sleep(wait)
+            waited += wait
+
+    def _charge_credit(self, complexity):
+        """After a query: deduct the actual complexity from the shared budget.
+        Best-effort."""
+        if self._credit_store is None or not complexity:
+            return
+        try:
+            self._credit_store.charge(complexity)
+        except Exception:
+            pass  # fail open
 
     def get_credit_usage(self):
         """Accumulated ShipHero usage for this process session::
