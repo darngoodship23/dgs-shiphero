@@ -21,13 +21,23 @@ Two call styles:
 
 Every call is metered (:meth:`get_credit_usage`) — the seed for the
 cross-process shared credit ledger planned for the backend merge.
+
+Transport is one kept-alive session per thread (``_http``) rather than a new
+connection per call, and a credit-ledger charge is paid on a background
+thread (``credit.BackgroundCharger``) rather than while the caller waits.
 """
 import os
 import time
 
 import requests
 
+from . import _http
+from .credit import BackgroundCharger
 from .errors import ShipHeroError
+
+# One per process, shared by every client: charges from all of them drain
+# through one worker thread.
+_charger = BackgroundCharger()
 
 SHIPHERO_AUTH_URL = "https://public-api.shiphero.com/auth/refresh"
 SHIPHERO_GRAPHQL_URL = "https://public-api.shiphero.com/graphql"
@@ -77,8 +87,7 @@ class ShipHeroClient:
             raise RuntimeError(f"{self._refresh_token_env} not set")
 
         try:
-            resp = requests.post(self._auth_url,
-                                 json={"refresh_token": token}, timeout=10)
+            resp = _http.post(self._auth_url, json={"refresh_token": token}, timeout=10)
         except requests.RequestException as e:
             raise RuntimeError(f"ShipHero auth unreachable: {e}") from e
         if not resp.ok:
@@ -102,7 +111,7 @@ class ShipHeroClient:
         self._await_credit()  # shared-budget gate (fail-open; no-op without a store)
         headers = {"Authorization": f"Bearer {self.get_access_token()}",
                    "Content-Type": "application/json"}
-        resp = requests.post(
+        resp = _http.post(
             self._graphql_url,
             json={"query": query, "variables": variables or {}},
             headers=headers, timeout=timeout,
@@ -192,27 +201,28 @@ class ShipHeroClient:
             waited += wait
 
     def _charge_credit(self, complexity):
-        """After a query: deduct the actual complexity from the shared budget.
-        Best-effort."""
+        """After a query: deduct the actual complexity from the shared budget,
+        on the background charger -- the caller already has its answer and
+        does not wait on the bookkeeping. Best-effort; a failure is counted and
+        logged there, never raised here."""
         if self._credit_store is None or not complexity:
             return
-        try:
-            self._credit_store.charge(complexity)
-        except Exception:
-            pass  # fail open
+        _charger.submit(self._credit_store, complexity)
 
     def get_credit_usage(self):
         """Accumulated ShipHero usage for this process session::
 
-            {"calls": int, "credits": int, "recent": [{"op", "complexity"}, ...]}
+            {"calls": int, "credits": int, "recent": [{"op", "complexity"}, ...],
+             "ledger": {"charged", "failed", "dropped", "pending", "last_error"}}
 
         ``credits`` sums the ``complexity`` ShipHero returns on queries that
-        request that field (calls without it still count toward ``calls``). This
-        per-call metering is the hook the cross-process shared credit ledger
-        (backend-merge phase 2) will persist."""
+        request that field (calls without it still count toward ``calls``).
+        ``ledger`` is the background charger's account of the shared credit
+        ledger, so a charge that failed or was dropped shows up somewhere a
+        person reads rather than only in a log."""
         u = self._usage
         return {"calls": u["calls"], "credits": u["credits"],
-                "recent": list(u["log"])}
+                "recent": list(u["log"]), "ledger": _charger.stats()}
 
 
 def default_client():
