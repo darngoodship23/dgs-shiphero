@@ -44,7 +44,7 @@ def test_credit_wait_none_for_non_credit_error():
 # ---- request() ----
 
 def test_request_returns_data_and_meters_complexity(sh, monkeypatch):
-    monkeypatch.setattr(client_mod.requests, "post",
+    monkeypatch.setattr(client_mod._http, "post",
                         lambda *a, **k: FakeResp(json_data={"data": {
                             "orders": {"complexity": 101, "data": {"edges": []}}}}))
     data = sh.request("query { orders { complexity data { edges { node { id } } } } }")
@@ -56,14 +56,14 @@ def test_request_returns_data_and_meters_complexity(sh, monkeypatch):
 
 
 def test_request_raises_shiphero_error_on_graphql_errors(sh, monkeypatch):
-    monkeypatch.setattr(client_mod.requests, "post",
+    monkeypatch.setattr(client_mod._http, "post",
                         lambda *a, **k: FakeResp(json_data={"errors": [{"code": 30}]}))
     with pytest.raises(ShipHeroError):
         sh.request("{ x }")
 
 
 def test_request_raises_runtimeerror_with_status_on_http_failure(sh, monkeypatch):
-    monkeypatch.setattr(client_mod.requests, "post",
+    monkeypatch.setattr(client_mod._http, "post",
                         lambda *a, **k: FakeResp(ok=False, status_code=429, text="slow down"))
     with pytest.raises(RuntimeError) as ei:
         sh.request("{ x }")
@@ -126,8 +126,74 @@ def test_token_is_cached(monkeypatch):
         posts["n"] += 1
         return FakeResp(json_data={"access_token": "abc", "expires_in": 3600})
 
-    monkeypatch.setattr(client_mod.requests, "post", fake_post)
+    monkeypatch.setattr(client_mod._http, "post", fake_post)
     c = ShipHeroClient(refresh_token="r")
     assert c.get_access_token() == "abc"
     assert c.get_access_token() == "abc"
     assert posts["n"] == 1  # second call served from cache
+
+
+# ---- shared credit ledger (Phase 3) ----
+
+class FakeStore:
+    def __init__(self, gate_results=None):
+        self.gate_calls = 0
+        self.charges = []
+        self._results = list(gate_results or [{"ok": True}])
+
+    def gate(self):
+        self.gate_calls += 1
+        return self._results[min(self.gate_calls - 1, len(self._results) - 1)]
+
+    def charge(self, cost):
+        self.charges.append(cost)
+        return {"ok": True}
+
+
+def _client_with_store(store):
+    c = ShipHeroClient(refresh_token="r", credit_store=store)
+    c._token_cache = {"access_token": "tok", "expires_at": 1e18}
+    return c
+
+
+def test_credit_gate_before_and_charge_after(monkeypatch):
+    store = FakeStore([{"ok": True}])
+    c = _client_with_store(store)
+    monkeypatch.setattr(client_mod._http, "post", lambda *a, **k: FakeResp(
+        json_data={"data": {"orders": {"complexity": 42, "data": {}}}}))
+    c.request("query { orders { complexity data { x } } }")
+    assert store.gate_calls == 1
+    assert client_mod._charger.flush()  # the charge is paid off the caller's thread
+    assert store.charges == [42]  # charged the actual complexity
+
+
+def test_credit_no_charge_without_complexity(monkeypatch):
+    store = FakeStore([{"ok": True}])
+    c = _client_with_store(store)
+    monkeypatch.setattr(client_mod._http, "post", lambda *a, **k: FakeResp(
+        json_data={"data": {"account": {"data": {}}}}))
+    c.request("{ account { data { id } } }")
+    assert client_mod._charger.flush()
+    assert store.gate_calls == 1 and store.charges == []
+
+
+def test_credit_waits_then_proceeds(monkeypatch):
+    store = FakeStore([{"ok": False, "wait_seconds": 0.5}, {"ok": True}])
+    c = _client_with_store(store)
+    slept = []
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(client_mod._http, "post",
+                        lambda *a, **k: FakeResp(json_data={"data": {"ok": True}}))
+    c.request("{ x }")
+    assert store.gate_calls == 2 and slept == [0.5]
+
+
+def test_credit_fail_open_on_store_error(monkeypatch):
+    class BadStore:
+        def gate(self): raise RuntimeError("ledger down")
+        def charge(self, cost): raise RuntimeError("ledger down")
+
+    c = _client_with_store(BadStore())
+    monkeypatch.setattr(client_mod._http, "post",
+                        lambda *a, **k: FakeResp(json_data={"data": {"ok": True}}))
+    assert c.request("{ x }") == {"ok": True}  # ledger outage never blocks ShipHero

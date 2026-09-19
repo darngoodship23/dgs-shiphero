@@ -10,7 +10,7 @@ auth, transport, credit-retry, error shape, and usage metering — and no drift.
 Pinned from git in each app's `requirements.txt`:
 
 ```
-dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.1.0
+dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.3.0
 ```
 
 Local dev (editable), from a checkout next to the app:
@@ -40,6 +40,23 @@ sh.get_credit_usage()   # {"calls", "credits", "recent": [...]} for this process
   `credit_attempts=` / `max_credit_wait=` to widen the budget for bulk jobs.
 - `ShipHeroError.credit_wait` returns the seconds to wait on a code-30
   credit-exhaustion error (else `None`).
+
+## Transport and the credit ledger (0.3.0)
+
+- Every HTTP call goes through `dgs_shiphero._http`: one kept-alive
+  `requests.Session` per thread (and per process, so a gunicorn fork never
+  shares its parent's socket). ShipHero calls and the ledger's gate/charge no
+  longer open a new TLS connection each time.
+- With a credit store, the **gate** still happens before the query, but the
+  **charge** is queued on a background thread (`credit.BackgroundCharger`,
+  bounded at 256) instead of making the caller wait for a second Supabase
+  round trip. Failures are counted and logged (at most one line a minute
+  during an outage); a charge that finds the backlog full is dropped, counted
+  and logged. `get_credit_usage()["ledger"]` reports charged / failed /
+  dropped / pending / last_error.
+- Tests: patch `dgs_shiphero._http.post` (a patch of `requests.post` no
+  longer reaches the client). `tests/conftest.py` fails any test whose
+  request gets as far as a real adapter.
 
 ## Scope
 

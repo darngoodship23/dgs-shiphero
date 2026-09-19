@@ -18,13 +18,15 @@ from .client import (
     ShipHeroClient,
     default_client,
 )
+from .credit import PostgrestCreditStore
 from .errors import ShipHeroError
 
 __all__ = [
     "ShipHeroClient",
     "ShipHeroError",
+    "PostgrestCreditStore",
     "SHIPHERO_AUTH_URL",
     "SHIPHERO_GRAPHQL_URL",
     "default_client",
 ]
-__version__ = "0.1.0"
+__version__ = "0.3.0"
