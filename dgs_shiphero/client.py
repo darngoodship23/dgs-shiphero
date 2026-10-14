@@ -52,6 +52,24 @@ def _op_snippet(query):
     return " ".join(str(query).split())[:80]
 
 
+# ShipHero's gateway answering 502/503/504 is a passing outage on its side, the
+# same as a timeout: on 2026-10-14 one 502 at 08:30 UTC failed ops-portal's
+# whole lojistic-api run. A READ is asked again; a mutation is not, since the
+# gateway can answer after ShipHero has applied it, and asking again would apply
+# it twice. A 500 is left alone -- it can be our own query's fault.
+_GATEWAY_ERRORS = ("shiphero 502", "shiphero 503", "shiphero 504")
+
+
+def _is_mutation(query):
+    """Does this GraphQL document start a mutation? Comments and whitespace
+    before the operation keyword are skipped."""
+    for line in str(query or "").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if text:
+            return text.startswith("mutation")
+    return False
+
+
 class ShipHeroClient:
     """A ShipHero GraphQL client bound to one refresh token."""
 
@@ -133,7 +151,8 @@ class ShipHeroClient:
         Waits out credit exhaustion (code 30) using the deficit ShipHero reports
         — buffered by 1s and capped at ``max_credit_wait`` so a single worker is
         never parked for long — and retries transient timeouts / 429s / auth
-        blips a few times. Raises once either budget is spent.
+        blips a few times, and a read (never a mutation) on ShipHero's gateway
+        errors, 502/503/504. Raises once either budget is spent.
 
         Defaults are tuned for the request path (a shared, bounded wait). Bulk
         off-request callers (e.g. an overnight sync) can raise ``credit_attempts``
@@ -155,7 +174,9 @@ class ShipHeroClient:
             except RuntimeError as exc:
                 msg = str(exc).lower()
                 transient = ("timed out" in msg or "timeout" in msg
-                             or "429" in msg or "unreachable" in msg)
+                             or "429" in msg or "unreachable" in msg
+                             or (msg.startswith(_GATEWAY_ERRORS)
+                                 and not _is_mutation(query)))
                 if attempt >= attempts or not transient:
                     raise
                 time.sleep(min(2 ** (attempt - 1), 8))

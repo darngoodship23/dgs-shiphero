@@ -110,6 +110,78 @@ def test_graphql_does_not_retry_non_credit_error(sh, monkeypatch):
     assert calls["n"] == 1  # not spun on
 
 
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_graphql_retries_a_read_on_a_gateway_error(sh, monkeypatch, status):
+    """ShipHero's gateway failing once must not fail the caller (lojistic-api,
+    2026-10-14: one 502 lost the whole morning run)."""
+    calls = {"n": 0}
+
+    def flaky(query, variables=None, timeout=30):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(f"ShipHero {status}: <html><title>{status} Bad Gateway</title></html>")
+        return {"ok": True}
+
+    monkeypatch.setattr(sh, "request", flaky)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda *_: None)
+    assert sh.graphql("query { shipments { data { edges { node { id } } } } }") == {"ok": True}
+    assert calls["n"] == 2
+
+
+def test_graphql_never_retries_a_mutation_on_a_gateway_error(sh, monkeypatch):
+    """The gateway can answer 502 after ShipHero applied the write."""
+    calls = {"n": 0}
+
+    def gateway(query, variables=None, timeout=30):
+        calls["n"] += 1
+        raise RuntimeError("ShipHero 502: <html>Bad Gateway</html>")
+
+    monkeypatch.setattr(sh, "request", gateway)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        sh.graphql("# set a size\n  mutation ($d: UpdateProductInput!) { product_update(data: $d) { request_id } }")
+    assert calls["n"] == 1
+
+
+def test_graphql_does_not_retry_a_500(sh, monkeypatch):
+    calls = {"n": 0}
+
+    def server_error(query, variables=None, timeout=30):
+        calls["n"] += 1
+        raise RuntimeError("ShipHero 500: Internal Server Error")
+
+    monkeypatch.setattr(sh, "request", server_error)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        sh.graphql("{ x }")
+    assert calls["n"] == 1
+
+
+def test_graphql_gives_up_on_a_gateway_error_after_its_attempts(sh, monkeypatch):
+    calls = {"n": 0}
+
+    def gateway(query, variables=None, timeout=30):
+        calls["n"] += 1
+        raise RuntimeError("ShipHero 503: Service Unavailable")
+
+    monkeypatch.setattr(sh, "request", gateway)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        sh.graphql("{ x }", attempts=3)
+    assert calls["n"] == 3
+
+
+@pytest.mark.parametrize("query, want", [
+    ("mutation { x }", True),
+    ("  # comment\n mutation M { x }", True),
+    ("query Q { x }", False),
+    ("{ x }", False),
+    ("", False),
+])
+def test_is_mutation(query, want):
+    assert client_mod._is_mutation(query) is want
+
+
 # ---- auth ----
 
 def test_missing_token_raises_named_env(monkeypatch):
