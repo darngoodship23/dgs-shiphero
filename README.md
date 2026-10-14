@@ -10,7 +10,7 @@ auth, transport, credit-retry, error shape, and usage metering — and no drift.
 Pinned from git in each app's `requirements.txt`:
 
 ```
-dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.3.0
+dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.3.1
 ```
 
 Local dev (editable), from a checkout next to the app:
