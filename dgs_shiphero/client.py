@@ -14,6 +14,8 @@ Two call styles:
 * :meth:`ShipHeroClient.request` — single-shot, raises on the first error. This
   is exactly what ops-portal's ``_graphql_request`` did; callers that want
   resilience wrap it themselves (e.g. the SLA sync's patient credit-retry loop).
+  The one exception is a refused access token (401): it is replaced and the
+  request sent once more.
 * :meth:`ShipHeroClient.graphql` — waits out ShipHero's shared-credit
   exhaustion (code 30) using the deficit ShipHero reports, and retries transient
   timeouts. Bounded and request-path safe by default; the returns grading /
@@ -60,6 +62,16 @@ def _op_snippet(query):
 _GATEWAY_ERRORS = ("shiphero 502", "shiphero 503", "shiphero 504")
 
 
+# ShipHero answering 401 means it refused the access token and ran nothing. An
+# access token lasts weeks and was kept until it expired, so after ShipHero's
+# outage on 2026-11-01, when it refused tokens it had issued before ("Unauthorized
+# request", then "Unable to find appropriate key"), ops-portal's long-running
+# order worker failed every packing-note call from 2026-11-02 00:04 UTC until it
+# was restarted, while its jobs, each a new process, got new tokens and worked.
+# The refused token is dropped and the request sent ONCE more with a new one --
+# a mutation too, since nothing was applied.
+
+
 def _is_mutation(query):
     """Does this GraphQL document start a mutation? Comments and whitespace
     before the operation keyword are skipped."""
@@ -92,7 +104,8 @@ class ShipHeroClient:
 
     # ---- auth -------------------------------------------------------------
     def get_access_token(self):
-        """A valid access token, refreshed from the refresh token when expired.
+        """A valid access token, refreshed from the refresh token when expired
+        or refused (:meth:`request` drops a token ShipHero answers 401 to).
         Raises ``RuntimeError`` (never a bare ``HTTPError``) so callers can
         surface a clean message — a bad/missing token is the most common
         misconfig."""
@@ -119,21 +132,39 @@ class ShipHeroClient:
         c["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
         return c["access_token"]
 
+    def _drop_token(self, refused):
+        """Forget the cached access token if it is still the one ShipHero just
+        refused -- another thread may already have fetched a new one."""
+        c = self._token_cache
+        if c["access_token"] == refused:
+            c["access_token"] = None
+            c["expires_at"] = 0
+
     # ---- transport --------------------------------------------------------
+    def _post(self, query, variables, timeout):
+        """One POST of the query; returns the response and the token it used."""
+        token = self.get_access_token()
+        resp = _http.post(
+            self._graphql_url,
+            json={"query": query, "variables": variables or {}},
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        return resp, token
+
     def request(self, query, variables=None, timeout=30):
         """Single-shot GraphQL call. Returns the ``data`` object; raises
         :class:`ShipHeroError` on GraphQL errors and ``RuntimeError`` on HTTP
         failure. No retry — the exact contract ops-portal's ``_graphql_request``
         had (the HTTP-error message still starts with ``ShipHero <status>`` so
-        callers that string-match ``"429"`` keep working)."""
+        callers that string-match ``"429"`` keep working) — except one: a 401,
+        a refused access token, gets a new token and is sent once more."""
         self._await_credit()  # shared-budget gate (fail-open; no-op without a store)
-        headers = {"Authorization": f"Bearer {self.get_access_token()}",
-                   "Content-Type": "application/json"}
-        resp = _http.post(
-            self._graphql_url,
-            json={"query": query, "variables": variables or {}},
-            headers=headers, timeout=timeout,
-        )
+        resp, token = self._post(query, variables, timeout)
+        if resp.status_code == 401:
+            self._drop_token(token)
+            resp, _ = self._post(query, variables, timeout)
         if not resp.ok:
             raise RuntimeError(f"ShipHero {resp.status_code}: {resp.text[:500]}")
         result = resp.json()

@@ -205,6 +205,96 @@ def test_token_is_cached(monkeypatch):
     assert posts["n"] == 1  # second call served from cache
 
 
+# ---- a refused access token (401) ----
+
+REFUSED = FakeResp(ok=False, status_code=401, text='{"message": "Unauthorized request"}')
+
+
+class FakeShipHero:
+    """Both endpoints: /auth/refresh hands out tok-1, tok-2, ...; /graphql
+    answers each call with the next of ``answers`` and records its token."""
+
+    def __init__(self, answers, on_query=None):
+        self.answers = list(answers)
+        self.on_query = on_query
+        self.refreshes = 0
+        self.sent_with = []
+
+    def post(self, url, **kwargs):
+        if url == client_mod.SHIPHERO_AUTH_URL:
+            self.refreshes += 1
+            return FakeResp(json_data={"access_token": f"tok-{self.refreshes}",
+                                       "expires_in": 3600})
+        self.sent_with.append(kwargs["headers"]["Authorization"].split()[-1])
+        if self.on_query:
+            self.on_query()
+        return self.answers.pop(0)
+
+
+def _client_holding(token):
+    """A client still holding a token that has weeks left, as the long-running
+    worker was on 2026-11-02."""
+    c = ShipHeroClient(refresh_token="r")
+    c._token_cache = {"access_token": token, "expires_at": 1e18}
+    return c
+
+
+def test_a_refused_token_is_replaced_and_the_request_sent_again(monkeypatch):
+    fake = FakeShipHero([REFUSED, FakeResp(json_data={"data": {"ok": True}})])
+    monkeypatch.setattr(client_mod._http, "post", fake.post)
+    c = _client_holding("old")
+    assert c.request("{ x }") == {"ok": True}
+    assert fake.sent_with == ["old", "tok-1"]
+    assert fake.refreshes == 1
+
+    fake.answers.append(FakeResp(json_data={"data": {"ok": True}}))
+    c.request("{ x }")
+    assert fake.sent_with[-1] == "tok-1" and fake.refreshes == 1  # the new one is kept
+
+
+def test_a_second_refusal_raises_the_401(monkeypatch):
+    fake = FakeShipHero([REFUSED, REFUSED])
+    monkeypatch.setattr(client_mod._http, "post", fake.post)
+    with pytest.raises(RuntimeError) as ei:
+        _client_holding("old").request("{ x }")
+    assert str(ei.value).startswith("ShipHero 401: ")
+    assert fake.sent_with == ["old", "tok-1"] and fake.refreshes == 1
+
+
+def test_a_refused_mutation_is_sent_again_only_once(monkeypatch):
+    """Through graphql() too: its retries never add a third send."""
+    fake = FakeShipHero([REFUSED, REFUSED, FakeResp(json_data={"data": {"ok": True}})])
+    monkeypatch.setattr(client_mod._http, "post", fake.post)
+    monkeypatch.setattr(client_mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="^ShipHero 401: "):
+        _client_holding("old").graphql(
+            "mutation ($d: UpdateOrderInput!) { order_update(data: $d) { request_id } }")
+    assert fake.sent_with == ["old", "tok-1"]
+
+
+def test_a_token_another_thread_already_replaced_is_kept(monkeypatch):
+    c = _client_holding("old")
+
+    def another_thread_refreshes():
+        if c._token_cache["access_token"] == "old":
+            c._token_cache = {"access_token": "theirs", "expires_at": 1e18}
+
+    fake = FakeShipHero([REFUSED, FakeResp(json_data={"data": {"ok": True}})],
+                        on_query=another_thread_refreshes)
+    monkeypatch.setattr(client_mod._http, "post", fake.post)
+    assert c.request("{ x }") == {"ok": True}
+    assert fake.sent_with == ["old", "theirs"] and fake.refreshes == 0
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_only_a_401_gets_a_new_token(monkeypatch, status):
+    fake = FakeShipHero([FakeResp(ok=False, status_code=status, text="no")])
+    monkeypatch.setattr(client_mod._http, "post", fake.post)
+    with pytest.raises(RuntimeError, match=f"^ShipHero {status}: "):
+        _client_holding("old").request("{ x }")
+    assert fake.sent_with == ["old"] and fake.refreshes == 0
+
+
 # ---- shared credit ledger (Phase 3) ----
 
 class FakeStore:
