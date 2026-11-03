@@ -10,7 +10,7 @@ auth, transport, credit-retry, error shape, and usage metering — and no drift.
 Pinned from git in each app's `requirements.txt`:
 
 ```
-dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.3.1
+dgs-shiphero @ git+https://github.com/darngoodship23/dgs-shiphero@v0.3.2
 ```
 
 Local dev (editable), from a checkout next to the app:
@@ -57,6 +57,19 @@ sh.get_credit_usage()   # {"calls", "credits", "recent": [...]} for this process
 - Tests: patch `dgs_shiphero._http.post` (a patch of `requests.post` no
   longer reaches the client). `tests/conftest.py` fails any test whose
   request gets as far as a real adapter.
+
+## A refused access token (0.3.2)
+
+- The access token is cached until it expires, which is weeks away. When
+  ShipHero answers **401**, it refused the token and ran nothing, so
+  `request()` drops the token, gets a new one from the refresh token and sends
+  the same request **once** more -- a mutation too. A second 401 raises
+  `ShipHero 401: ...` as before. `graphql()` goes through `request()`, and its
+  own retries don't add a third send.
+- Before this, a long-running process kept a refused token until it was
+  restarted: after ShipHero's outage on 2026-11-01, ops-portal's order worker
+  failed every packing-note call from 2026-11-02 00:04 UTC, while its jobs,
+  each a new process, kept working.
 
 ## Scope
 
